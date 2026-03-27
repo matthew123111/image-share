@@ -199,7 +199,7 @@ def render_upload_grid(uploads: list[dict]) -> str:
 
 def render_home(base_url: str, uploads: list[dict]) -> str:
     upload_count = len(uploads)
-        return f"""<!doctype html>
+    return f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
