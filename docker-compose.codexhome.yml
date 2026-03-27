@@ -1,0 +1,17 @@
+services:
+  image-share:
+    container_name: ${CONTAINER_NAME:-image-share}
+    build:
+      context: .
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      HOST: 0.0.0.0
+      PORT: ${HOST_PORT:-8102}
+      DATA_DIR: /data
+      UPLOAD_DIR: /data/uploads
+      METADATA_DIR: /data/metadata
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-25}
+      BASE_URL: ${BASE_URL:-}
+    volumes:
+      - ./data:/data
