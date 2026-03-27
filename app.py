@@ -17,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
-APP_TITLE = os.getenv("APP_TITLE", "Image Share")
+APP_TITLE = os.getenv("APP_TITLE", "File Share")
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).resolve().parent / "data"))
@@ -32,6 +32,34 @@ SESSION_COOKIE_MAX_AGE = int(os.getenv("SESSION_COOKIE_MAX_AGE", str(60 * 60 * 2
 SESSION_ID_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 VISIBLE_UPLOAD_LIMIT = 12
 
+UPLOAD_ACCEPT_EXTENSIONS = [
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".heic",
+    ".heif",
+    ".pdf",
+    ".txt",
+    ".csv",
+    ".rtf",
+    ".md",
+    ".json",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".odt",
+    ".ods",
+    ".zip",
+]
+UPLOAD_ACCEPT = ",".join(UPLOAD_ACCEPT_EXTENSIONS)
+ALLOWED_FILE_LABEL = ", ".join(extension.removeprefix(".") for extension in UPLOAD_ACCEPT_EXTENSIONS)
+
 ALLOWED_EXTENSIONS = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -41,6 +69,21 @@ ALLOWED_EXTENSIONS = {
     ".bmp": "image/bmp",
     ".heic": "image/heic",
     ".heif": "image/heif",
+    ".pdf": "application/pdf",
+    ".txt": "text/plain",
+    ".csv": "text/csv",
+    ".rtf": "application/rtf",
+    ".md": "text/markdown",
+    ".json": "application/json",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".odt": "application/vnd.oasis.opendocument.text",
+    ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+    ".zip": "application/zip",
 }
 
 MIME_TO_EXTENSION = {
@@ -51,12 +94,37 @@ MIME_TO_EXTENSION = {
     "image/bmp": ".bmp",
     "image/heic": ".heic",
     "image/heif": ".heif",
+    "application/pdf": ".pdf",
+    "text/plain": ".txt",
+    "text/csv": ".csv",
+    "application/rtf": ".rtf",
+    "text/markdown": ".md",
+    "application/json": ".json",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.ms-powerpoint": ".ppt",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "application/vnd.oasis.opendocument.text": ".odt",
+    "application/vnd.oasis.opendocument.spreadsheet": ".ods",
+    "application/zip": ".zip",
+}
+
+IMAGE_EXTENSIONS = {extension for extension, mime_type in ALLOWED_EXTENSIONS.items() if mime_type.startswith("image/")}
+INLINE_CONTENT_TYPES = {
+    "application/pdf",
+    "text/plain",
+    "text/csv",
+    "text/markdown",
+    "application/json",
 }
 
 
 def ensure_storage_dirs() -> None:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     METADATA_DIR.mkdir(parents=True, exist_ok=True)
+
 
 
 def format_size(size_bytes: int) -> str:
@@ -67,12 +135,37 @@ def format_size(size_bytes: int) -> str:
     return f"{size_bytes / (1024 * 1024):.2f} MB"
 
 
+
 def format_timestamp(timestamp_epoch: float) -> str:
     return datetime.fromtimestamp(timestamp_epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
+
 def metadata_path_for(filename: str) -> Path:
     return METADATA_DIR / f"{filename}.json"
+
+
+
+def display_extension(file_name: str) -> str:
+    suffix = Path(file_name).suffix.lower().lstrip(".")
+    return suffix[:8].upper() if suffix else "FILE"
+
+
+
+def is_image_file(content_type: str, file_name: str) -> bool:
+    normalized_content_type = (content_type or "").lower().strip()
+    if normalized_content_type.startswith("image/"):
+        return True
+    return Path(file_name).suffix.lower() in IMAGE_EXTENSIONS
+
+
+
+def build_content_disposition(disposition: str, file_name: str) -> str:
+    normalized_name = Path(file_name).name or "download"
+    ascii_name = re.sub(r'[^A-Za-z0-9._-]+', "_", normalized_name).strip("._") or "download"
+    encoded_name = quote(normalized_name)
+    return f'{disposition}; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_name}'
+
 
 
 def write_upload_record(
@@ -96,7 +189,8 @@ def write_upload_record(
     return record
 
 
-def load_upload_record(metadata_path: Path) -> dict | None:
+
+def load_upload_record(metadata_path: Path, require_file: bool = True) -> dict | None:
     try:
         data = json.loads(metadata_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -108,43 +202,56 @@ def load_upload_record(metadata_path: Path) -> dict | None:
         return None
 
     file_path = UPLOAD_DIR / filename
-    if not file_path.is_file():
+    file_exists = file_path.is_file()
+    if require_file and not file_exists:
         return None
+
+    file_stats = file_path.stat() if file_exists else None
 
     uploaded_at_epoch = data.get("uploaded_at_epoch")
     try:
         uploaded_at_epoch = float(uploaded_at_epoch)
     except (TypeError, ValueError):
-        uploaded_at_epoch = file_path.stat().st_mtime
+        uploaded_at_epoch = file_stats.st_mtime if file_stats else datetime.now(timezone.utc).timestamp()
 
     size_bytes = data.get("size_bytes")
     try:
         size_bytes = int(size_bytes)
     except (TypeError, ValueError):
-        size_bytes = file_path.stat().st_size
+        size_bytes = file_stats.st_size if file_stats else 0
+
+    original_name = Path(str(data.get("original_name", filename))).name or filename
+    content_type = str(data.get("content_type", "")).strip()
 
     return {
         "filename": filename,
         "session_id": session_id,
-        "original_name": str(data.get("original_name", filename)) or filename,
+        "original_name": original_name,
         "size_bytes": size_bytes,
-        "content_type": str(data.get("content_type", "")),
+        "content_type": content_type,
         "uploaded_at_epoch": uploaded_at_epoch,
     }
 
 
+
 def serialize_upload_item(base_url: str, record: dict) -> dict:
     filename = record["filename"]
+    original_name = record["original_name"]
+    content_type = record["content_type"] or mimetypes.guess_type(original_name)[0] or "application/octet-stream"
     uploaded_at_epoch = float(record["uploaded_at_epoch"])
     return {
         "filename": filename,
-        "original_name": record["original_name"],
+        "original_name": original_name,
         "url": f"{base_url}/files/{quote(filename)}",
         "size_bytes": int(record["size_bytes"]),
         "size_label": format_size(int(record["size_bytes"])),
         "uploaded_at_epoch": uploaded_at_epoch,
         "uploaded_at_label": format_timestamp(uploaded_at_epoch),
+        "content_type": content_type,
+        "is_image": is_image_file(content_type, original_name or filename),
+        "extension_label": display_extension(original_name or filename),
     }
+
 
 
 def session_uploads(base_url: str, session_id: str, limit: int = VISIBLE_UPLOAD_LIMIT) -> list[dict]:
@@ -162,39 +269,62 @@ def session_uploads(base_url: str, session_id: str, limit: int = VISIBLE_UPLOAD_
     return items[:limit]
 
 
-def render_upload_card(item: dict) -> str:
+
+def render_upload_visual(item: dict) -> str:
     safe_url = html.escape(item["url"])
     safe_original_name = html.escape(item["original_name"])
-    safe_size = html.escape(item["size_label"])
-    safe_uploaded_at = html.escape(item["uploaded_at_label"])
-    return f"""
-    <article class="upload-card">
+    safe_extension = html.escape(item["extension_label"])
+    if item["is_image"]:
+        return f"""
       <a class="thumb-link" href="{safe_url}" target="_blank" rel="noreferrer">
         <img class="thumb-image" src="{safe_url}" alt="{safe_original_name}" loading="lazy">
       </a>
+        """
+
+    return f"""
+      <a class="thumb-link file-thumb" href="{safe_url}" target="_blank" rel="noreferrer">
+        <span class="file-thumb-label">{safe_extension}</span>
+      </a>
+    """
+
+
+
+def render_upload_card(item: dict) -> str:
+    safe_url = html.escape(item["url"])
+    safe_filename = html.escape(item["filename"])
+    safe_original_name = html.escape(item["original_name"])
+    safe_size = html.escape(item["size_label"])
+    safe_uploaded_at = html.escape(item["uploaded_at_label"])
+    safe_extension = html.escape(item["extension_label"])
+    return f"""
+    <article class="upload-card" data-filename="{safe_filename}">
+      {render_upload_visual(item)}
       <div class="upload-content">
         <div class="upload-topline">
           <strong class="upload-name">{safe_original_name}</strong>
           <span class="upload-time">{safe_uploaded_at}</span>
         </div>
-        <div class="upload-subline">{safe_size}</div>
+        <div class="upload-subline">{safe_extension} - {safe_size}</div>
         <div class="upload-links">
           <a class="mini-link" href="{safe_url}" target="_blank" rel="noreferrer">Open</a>
+          <button type="button" class="mini-button delete-button" data-filename="{safe_filename}">Delete</button>
         </div>
       </div>
     </article>
     """
 
 
+
 def render_upload_grid(uploads: list[dict]) -> str:
     if not uploads:
         return """
         <div class="empty-state">
-          <strong>No uploads.</strong>
+          <strong>No files.</strong>
         </div>
         """
 
     return "\n".join(render_upload_card(item) for item in uploads)
+
 
 
 def render_home(base_url: str, uploads: list[dict]) -> str:
@@ -214,6 +344,8 @@ def render_home(base_url: str, uploads: list[dict]) -> str:
       --muted: #6b7280;
       --accent: #2563eb;
       --accent-dark: #1d4ed8;
+      --danger: #b91c1c;
+      --danger-bg: #fef2f2;
       --ok-bg: #effaf3;
       --ok-line: #b7e1c4;
       --error-bg: #fff1f1;
@@ -282,12 +414,6 @@ def render_home(base_url: str, uploads: list[dict]) -> str:
       font-size: 1.05rem;
     }}
 
-    .section-head p {{
-      margin: 0.25rem 0 0;
-      color: var(--muted);
-      font-size: 0.92rem;
-    }}
-
     .count-chip {{
       white-space: nowrap;
       padding: 0.35rem 0.6rem;
@@ -351,7 +477,8 @@ def render_home(base_url: str, uploads: list[dict]) -> str:
     }}
 
     .primary-button,
-    .secondary-button {{
+    .secondary-button,
+    .mini-button {{
       appearance: none;
       border: 1px solid var(--line);
       border-radius: 10px;
@@ -359,6 +486,8 @@ def render_home(base_url: str, uploads: list[dict]) -> str:
       font-size: 0.95rem;
       font-weight: 600;
       cursor: pointer;
+      background: #fff;
+      color: var(--text);
     }}
 
     .primary-button {{
@@ -367,13 +496,16 @@ def render_home(base_url: str, uploads: list[dict]) -> str:
       color: #fff;
     }}
 
-    .secondary-button {{
-      background: #fff;
-      color: var(--text);
+    .mini-button {{
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: var(--danger);
     }}
 
     .primary-button:disabled,
-    .secondary-button:disabled {{
+    .secondary-button:disabled,
+    .mini-button:disabled {{
       cursor: progress;
       opacity: 0.75;
     }}
@@ -425,18 +557,7 @@ def render_home(base_url: str, uploads: list[dict]) -> str:
       margin-top: 0.6rem;
       color: var(--muted);
       font-size: 0.9rem;
-    }}
-
-    .small-note {{
-      margin: 0.9rem 0 0;
-      color: var(--muted);
-      font-size: 0.9rem;
-      line-height: 1.5;
-    }}
-
-    .small-note code {{
-      font-family: "Consolas", monospace;
-      font-size: 0.95em;
+      word-break: break-word;
     }}
 
     .upload-grid {{
@@ -469,6 +590,21 @@ def render_home(base_url: str, uploads: list[dict]) -> str:
       height: 100%;
       object-fit: cover;
       display: block;
+    }}
+
+    .file-thumb {{
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #eff6ff;
+      color: var(--accent-dark);
+      text-decoration: none;
+    }}
+
+    .file-thumb-label {{
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
     }}
 
     .upload-content {{
@@ -504,7 +640,9 @@ def render_home(base_url: str, uploads: list[dict]) -> str:
 
     .upload-links {{
       display: flex;
+      gap: 0.85rem;
       margin-top: 0.55rem;
+      align-items: center;
     }}
 
     .mini-link {{
@@ -565,7 +703,7 @@ def render_home(base_url: str, uploads: list[dict]) -> str:
   <main>
     <header class="topbar">
       <div>
-        <h1>Image Share</h1>
+        <h1>{html.escape(APP_TITLE)}</h1>
         <p>{MAX_UPLOAD_MB} MB max</p>
       </div>
     </header>
@@ -580,13 +718,13 @@ def render_home(base_url: str, uploads: list[dict]) -> str:
 
         <form id="upload-form">
           <label class="dropzone">
-            <strong>Photo</strong>
+            <strong>File</strong>
             <span>Select a file.</span>
-            <input id="photo-input" type="file" name="photo" accept="image/*,.heic,.heif">
+            <input id="file-input" type="file" name="file" accept="{html.escape(UPLOAD_ACCEPT)}">
           </label>
           <label class="dropzone">
-            <strong>Paste</strong>
-            <span>Paste image here.</span>
+            <strong>Paste Image</strong>
+            <span>Paste here.</span>
             <textarea id="paste-input" class="paste-input" rows="3" placeholder="Paste image here"></textarea>
           </label>
           <button id="submit-button" class="primary-button" type="submit">Upload</button>
@@ -599,8 +737,7 @@ def render_home(base_url: str, uploads: list[dict]) -> str:
       <section class="gallery-panel">
         <div class="section-head">
           <div>
-            <h2>Your Uploads</h2>
-            <p>Only yours.</p>
+            <h2>Your Files</h2>
           </div>
           <div class="count-chip"><span id="gallery-count">{upload_count}</span></div>
         </div>
@@ -613,7 +750,7 @@ def render_home(base_url: str, uploads: list[dict]) -> str:
 
   <script>
     const form = document.getElementById("upload-form");
-    const input = document.getElementById("photo-input");
+    const input = document.getElementById("file-input");
     const pasteInput = document.getElementById("paste-input");
     const submitButton = document.getElementById("submit-button");
     const result = document.getElementById("result");
@@ -631,25 +768,46 @@ def render_home(base_url: str, uploads: list[dict]) -> str:
         .replace(/'/g, "&#39;");
     }}
 
-    function renderCard(item) {{
+    function renderVisual(item) {{
       const safeUrl = escapeHtml(item.url);
       const safeOriginalName = escapeHtml(item.original_name);
-      const safeSize = escapeHtml(item.size_label);
-      const safeUploadedAt = escapeHtml(item.uploaded_at_label);
+      const safeExtension = escapeHtml(item.extension_label);
 
-      return `
-        <article class="upload-card">
+      if (item.is_image) {{
+        return `
           <a class="thumb-link" href="${{safeUrl}}" target="_blank" rel="noreferrer">
             <img class="thumb-image" src="${{safeUrl}}" alt="${{safeOriginalName}}" loading="lazy">
           </a>
+        `;
+      }}
+
+      return `
+        <a class="thumb-link file-thumb" href="${{safeUrl}}" target="_blank" rel="noreferrer">
+          <span class="file-thumb-label">${{safeExtension}}</span>
+        </a>
+      `;
+    }}
+
+    function renderCard(item) {{
+      const safeUrl = escapeHtml(item.url);
+      const safeFilename = escapeHtml(item.filename);
+      const safeOriginalName = escapeHtml(item.original_name);
+      const safeSize = escapeHtml(item.size_label);
+      const safeUploadedAt = escapeHtml(item.uploaded_at_label);
+      const safeExtension = escapeHtml(item.extension_label);
+
+      return `
+        <article class="upload-card" data-filename="${{safeFilename}}">
+          ${{renderVisual(item)}}
           <div class="upload-content">
             <div class="upload-topline">
               <strong class="upload-name">${{safeOriginalName}}</strong>
               <span class="upload-time">${{safeUploadedAt}}</span>
             </div>
-            <div class="upload-subline">${{safeSize}}</div>
+            <div class="upload-subline">${{safeExtension}} - ${{safeSize}}</div>
             <div class="upload-links">
               <a class="mini-link" href="${{safeUrl}}" target="_blank" rel="noreferrer">Open</a>
+              <button type="button" class="mini-button delete-button" data-filename="${{safeFilename}}">Delete</button>
             </div>
           </div>
         </article>
@@ -666,7 +824,7 @@ def render_home(base_url: str, uploads: list[dict]) -> str:
       return null;
     }}
 
-    function clearPickedImage() {{
+    function clearPastedFile() {{
       pastedFile = null;
       pasteInput.value = "";
       pasteInput.classList.remove("ready");
@@ -692,7 +850,7 @@ def render_home(base_url: str, uploads: list[dict]) -> str:
 
     input.addEventListener("change", () => {{
       if (input.files.length) {{
-        clearPickedImage();
+        clearPastedFile();
       }}
     }});
 
@@ -736,6 +894,17 @@ def render_home(base_url: str, uploads: list[dict]) -> str:
       galleryCount.textContent = String(galleryGrid.querySelectorAll(".upload-card").length);
     }}
 
+    function ensureEmptyState() {{
+      if (galleryGrid.querySelector(".upload-card")) {{
+        return;
+      }}
+      if (galleryGrid.querySelector(".empty-state")) {{
+        return;
+      }}
+      galleryGrid.innerHTML = '<div class="empty-state"><strong>No files.</strong></div>';
+      updateGalleryCount();
+    }}
+
     function prependUpload(item) {{
       const emptyState = galleryGrid.querySelector(".empty-state");
       if (emptyState) {{
@@ -750,10 +919,20 @@ def render_home(base_url: str, uploads: list[dict]) -> str:
       updateGalleryCount();
     }}
 
+    function removeUpload(filename) {{
+      const card = Array.from(galleryGrid.querySelectorAll(".upload-card")).find((item) => item.dataset.filename === filename);
+      if (card) {{
+        card.remove();
+      }}
+      ensureEmptyState();
+      updateGalleryCount();
+    }}
+
     function showResult(payload) {{
       const safeUrl = escapeHtml(payload.url);
       const safeOriginalName = escapeHtml(payload.item.original_name);
       const safeSize = escapeHtml(payload.item.size_label);
+      const safeExtension = escapeHtml(payload.item.extension_label);
 
       result.innerHTML = `
         <strong>Link</strong>
@@ -762,7 +941,7 @@ def render_home(base_url: str, uploads: list[dict]) -> str:
           <button type="button" id="copy-button" class="secondary-button">Copy</button>
           <a class="primary-button" href="${{safeUrl}}" target="_blank" rel="noreferrer" style="text-decoration:none;text-align:center;">Open</a>
         </div>
-        <div class="share-meta">${{safeOriginalName}} • ${{safeSize}}</div>
+        <div class="share-meta">${{safeOriginalName}} - ${{safeExtension}} - ${{safeSize}}</div>
       `;
       result.className = "share-card show";
 
@@ -797,7 +976,7 @@ def render_home(base_url: str, uploads: list[dict]) -> str:
 
       const uploadFile = activeUploadFile();
       if (!uploadFile) {{
-        error.textContent = "Pick or paste a photo.";
+        error.textContent = "Pick or paste a file.";
         error.className = "error-card show";
         return;
       }}
@@ -807,7 +986,7 @@ def render_home(base_url: str, uploads: list[dict]) -> str:
 
       try {{
         const formData = new FormData();
-        formData.append("photo", uploadFile, uploadFile.name);
+        formData.append("file", uploadFile, uploadFile.name);
 
         const response = await fetch("/upload", {{
           method: "POST",
@@ -822,7 +1001,7 @@ def render_home(base_url: str, uploads: list[dict]) -> str:
         showResult(payload);
         prependUpload(payload.item);
         form.reset();
-        clearPickedImage();
+        clearPastedFile();
       }} catch (uploadError) {{
         error.textContent = uploadError.message;
         error.className = "error-card show";
@@ -831,20 +1010,66 @@ def render_home(base_url: str, uploads: list[dict]) -> str:
         submitButton.textContent = "Upload";
       }}
     }});
+
+    galleryGrid.addEventListener("click", async (event) => {{
+      const deleteButton = event.target.closest(".delete-button");
+      if (!deleteButton) {{
+        return;
+      }}
+
+      event.preventDefault();
+      error.className = "error-card";
+      error.textContent = "";
+      deleteButton.disabled = true;
+      deleteButton.textContent = "Deleting...";
+
+      try {{
+        const filename = deleteButton.dataset.filename;
+        const response = await fetch(`/files/${{encodeURIComponent(filename)}}`, {{
+          method: "DELETE",
+        }});
+        const payload = await response.json();
+        if (!response.ok || !payload.ok) {{
+          throw new Error(payload.error || "Delete failed.");
+        }}
+        removeUpload(filename);
+      }} catch (deleteError) {{
+        deleteButton.disabled = false;
+        deleteButton.textContent = "Delete";
+        error.textContent = deleteError.message;
+        error.className = "error-card show";
+      }}
+    }});
   </script>
 </body>
 </html>
 """
 
 
-class PhotoLinkDropHandler(BaseHTTPRequestHandler):
-    server_version = "PhotoLinkDrop/1.1"
+class FileShareHandler(BaseHTTPRequestHandler):
+    server_version = "FileShare/1.2"
 
     def do_GET(self) -> None:
         self.route_request(head_only=False)
 
     def do_HEAD(self) -> None:
         self.route_request(head_only=True)
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/upload":
+            self.handle_upload()
+            return
+
+        self.respond_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Not found"})
+
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/files/"):
+            self.handle_delete(parsed.path.removeprefix("/files/"))
+            return
+
+        self.respond_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Not found"})
 
     def route_request(self, head_only: bool) -> None:
         parsed = urlparse(self.path)
@@ -859,7 +1084,7 @@ class PhotoLinkDropHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/healthz":
-            self.respond_json(HTTPStatus.OK, {"ok": True, "service": "photo-link-drop"}, head_only=head_only)
+            self.respond_json(HTTPStatus.OK, {"ok": True, "service": "file-share"}, head_only=head_only)
             return
 
         if parsed.path.startswith("/files/"):
@@ -867,14 +1092,6 @@ class PhotoLinkDropHandler(BaseHTTPRequestHandler):
             return
 
         self.respond_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Not found"}, head_only=head_only)
-
-    def do_POST(self) -> None:
-        parsed = urlparse(self.path)
-        if parsed.path == "/upload":
-            self.handle_upload()
-            return
-
-        self.respond_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Not found"})
 
     def handle_upload(self) -> None:
         ensure_storage_dirs()
@@ -921,22 +1138,23 @@ class PhotoLinkDropHandler(BaseHTTPRequestHandler):
             environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type},
         )
 
-        if "photo" not in form:
+        field_name = "file" if "file" in form else "photo" if "photo" in form else None
+        if not field_name:
             self.respond_json(
                 HTTPStatus.BAD_REQUEST,
-                {"ok": False, "error": "Field 'photo' is required."},
+                {"ok": False, "error": "Field 'file' is required."},
                 extra_headers=self.session_headers(session_id, is_new_session),
             )
             return
 
-        file_field = form["photo"]
+        file_field = form[field_name]
         if isinstance(file_field, list):
             file_field = file_field[0]
 
         if not getattr(file_field, "file", None):
             self.respond_json(
                 HTTPStatus.BAD_REQUEST,
-                {"ok": False, "error": "Field 'photo' is empty."},
+                {"ok": False, "error": "Field 'file' is empty."},
                 extra_headers=self.session_headers(session_id, is_new_session),
             )
             return
@@ -965,7 +1183,7 @@ class PhotoLinkDropHandler(BaseHTTPRequestHandler):
                 HTTPStatus.BAD_REQUEST,
                 {
                     "ok": False,
-                    "error": "Only common image files are accepted: jpg, png, gif, webp, bmp, heic, heif.",
+                    "error": f"Accepted files: {ALLOWED_FILE_LABEL}.",
                 },
                 extra_headers=self.session_headers(session_id, is_new_session),
             )
@@ -994,6 +1212,56 @@ class PhotoLinkDropHandler(BaseHTTPRequestHandler):
                 "url": item["url"],
                 "item": item,
             },
+            extra_headers=self.session_headers(session_id, is_new_session),
+        )
+
+    def handle_delete(self, file_name: str) -> None:
+        ensure_storage_dirs()
+        session_id, is_new_session = self.ensure_session_id()
+        normalized = Path(file_name).name
+        if normalized != file_name or not normalized:
+            self.respond_json(
+                HTTPStatus.NOT_FOUND,
+                {"ok": False, "error": "Not found"},
+                extra_headers=self.session_headers(session_id, is_new_session),
+            )
+            return
+
+        metadata_path = metadata_path_for(normalized)
+        record = load_upload_record(metadata_path, require_file=False)
+        if not record:
+            self.respond_json(
+                HTTPStatus.NOT_FOUND,
+                {"ok": False, "error": "Not found"},
+                extra_headers=self.session_headers(session_id, is_new_session),
+            )
+            return
+
+        if record["session_id"] != session_id:
+            self.respond_json(
+                HTTPStatus.FORBIDDEN,
+                {"ok": False, "error": "Not your file."},
+                extra_headers=self.session_headers(session_id, is_new_session),
+            )
+            return
+
+        file_path = UPLOAD_DIR / normalized
+        try:
+            if file_path.exists():
+                file_path.unlink()
+            if metadata_path.exists():
+                metadata_path.unlink()
+        except OSError:
+            self.respond_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"ok": False, "error": "Delete failed."},
+                extra_headers=self.session_headers(session_id, is_new_session),
+            )
+            return
+
+        self.respond_json(
+            HTTPStatus.OK,
+            {"ok": True, "deleted": normalized},
             extra_headers=self.session_headers(session_id, is_new_session),
         )
 
@@ -1054,12 +1322,21 @@ class PhotoLinkDropHandler(BaseHTTPRequestHandler):
             self.respond_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Not found"}, head_only=head_only)
             return
 
-        mime_type = ALLOWED_EXTENSIONS.get(path.suffix.lower()) or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        record = load_upload_record(metadata_path_for(normalized))
+        if record:
+            mime_type = record["content_type"] or mimetypes.guess_type(record["original_name"])[0] or "application/octet-stream"
+            download_name = record["original_name"]
+        else:
+            mime_type = ALLOWED_EXTENSIONS.get(path.suffix.lower()) or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            download_name = path.name
+
         payload = path.read_bytes()
+        disposition = "inline" if mime_type.startswith("image/") or mime_type in INLINE_CONTENT_TYPES else "attachment"
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", mime_type)
         self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        self.send_header("Content-Disposition", build_content_disposition(disposition, download_name))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         if not head_only:
             self.wfile.write(payload)
@@ -1119,10 +1396,11 @@ class PhotoLinkDropHandler(BaseHTTPRequestHandler):
         print(f"[{timestamp}] {self.address_string()} {message}", flush=True)
 
 
+
 def main() -> None:
     ensure_storage_dirs()
-    server = ThreadingHTTPServer((HOST, PORT), PhotoLinkDropHandler)
-    print(f"Image Share listening on http://{HOST}:{PORT}", flush=True)
+    server = ThreadingHTTPServer((HOST, PORT), FileShareHandler)
+    print(f"File Share listening on http://{HOST}:{PORT}", flush=True)
     server.serve_forever()
 
 

@@ -1,10 +1,11 @@
-# Image Share
+# File Share
 
-Simple image upload app:
+Simple file sharing app:
 
-- Upload or paste an image.
+- Upload a file or paste an image.
 - Get a direct link back.
-- See only the uploads from your current browser session on the page.
+- Delete files from your current browser session.
+- See only the files from your current browser session on the page.
 - Store files in `data/uploads/` and session metadata in `data/metadata/`.
 
 ## Run
